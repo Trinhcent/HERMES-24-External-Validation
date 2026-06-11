@@ -1,0 +1,858 @@
+---
+title: "HERMES_24_Analysis_Clean"
+output: html_document
+date: "2026-05-20"
+---
+
+```{r}
+# REQUIRED PACKAGES
+# -- R version 4.4.2
+
+library(pROC)
+library(gtsummary)
+library(tidyverse)
+library(gtsummary)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(ggpubr)
+library(boot)
+library(caret)
+library(rms)
+library(lubridate)
+library(systemfonts)
+library(rlang)
+library(binom)
+```
+
+```{r}
+            # See data dictionary for dataset variables and definition
+```
+
+
+```{r}
+# 1 -- Discriminative Performance and Calibration Metrics for Binary Outcomes --
+# HELPER FUNCTION 1
+
+evaluate_binary_outcome <- function(data, outcome_var, age_var, nihss_var,
+                                    title_suffix = "",
+                                    negate_score = TRUE) {
+  
+  # ----------------------------------------
+  # Compute raw and centred HERMES-24 score
+  # ----------------------------------------
+  raw_score  <- 0.1 * data[[age_var]] + 1 * data[[nihss_var]]
+  score_mean <- mean(raw_score, na.rm = TRUE)
+  cat(sprintf("\nMean HERMES-24 score in cohort: %.4f\n", score_mean))
+  
+  # Negate for good outcomes (mRS <=2, mRS <=3)
+  # Do not negate for mortality
+  if (negate_score) {
+    data$fixed_score           <- -(raw_score - score_mean)  # centred
+    data$fixed_score_uncentred <- -(raw_score)               # uncentred
+    score_direction_label      <- "- 0.1000 * (age - mean_age/10) - 1.0000 * (NIHSS - mean_NIHSS)"
+  } else {
+    data$fixed_score           <-  (raw_score - score_mean)  # centred
+    data$fixed_score_uncentred <-  (raw_score)               # uncentred
+    score_direction_label      <- "+ 0.1000 * (age - mean_age/10) + 1.0000 * (NIHSS - mean_NIHSS)"
+  }
+  
+  # ----------------------------------------
+  # Model 1a — centred intercept-only model
+  # ----------------------------------------
+  logistic_model <- glm(
+    as.formula(paste0(outcome_var, " ~ offset(fixed_score)")),
+    data   = data,
+    family = binomial(link = "logit")
+  )
+  
+  intercept    <- coef(logistic_model)[1]
+  intercept_se <- summary(logistic_model)$coefficients[1, 2]
+  
+  # ----------------------------------------
+  # Model 1b — uncentred intercept-only model
+  # ----------------------------------------
+  logistic_model_uncentred <- glm(
+    as.formula(paste0(outcome_var, " ~ offset(fixed_score_uncentred)")),
+    data   = data,
+    family = binomial(link = "logit")
+  )
+  
+  intercept_uncentred    <- coef(logistic_model_uncentred)[1]
+  intercept_uncentred_se <- summary(logistic_model_uncentred)$coefficients[1, 2]
+  
+  # ----------------------------------------
+  # Print prediction equations
+  # ----------------------------------------
+  cat("\n--- Full Prediction Equation:", title_suffix, "---\n")
+  cat(sprintf("Mean HERMES-24 score (centring value): %.4f\n", score_mean))
+  cat(sprintf("Log-odds equation (centred):\n"))
+  cat(sprintf("  log(p / 1-p) = %.4f %s\n", intercept, score_direction_label))
+  cat(sprintf("Predicted probability equation:\n"))
+  cat(sprintf("  p = 1 / (1 + exp(-(%.4f %s)))\n", intercept, score_direction_label))
+  
+  # ----------------------------------------
+  # Print intercept comparison
+  # ----------------------------------------
+  cat("\n--- Intercept Comparison:", title_suffix, "---\n")
+  cat(sprintf("Uncentred intercept: %.4f (95%% CI: %.4f to %.4f)\n",
+              intercept_uncentred,
+              intercept_uncentred - 1.96 * intercept_uncentred_se,
+              intercept_uncentred + 1.96 * intercept_uncentred_se))
+  cat(sprintf("  Refers to: log-odds at HERMES-24 = 0 (age 0, NIHSS 0 — impossible patient)\n"))
+  cat(sprintf("Centred intercept:   %.4f (95%% CI: %.4f to %.4f)\n",
+              intercept,
+              intercept - 1.96 * intercept_se,
+              intercept + 1.96 * intercept_se))
+  cat(sprintf("  Refers to: log-odds at mean HERMES-24 score = %.2f (typical patient in cohort)\n", score_mean))
+  cat(sprintf("  Equivalent probability at mean score: %.4f\n", plogis(intercept)))
+  cat(sprintf("  Observed outcome rate:                %.4f\n", mean(data[[outcome_var]], na.rm = TRUE)))
+  cat(sprintf("  Difference (calibration-in-the-large): %.4f\n",
+              plogis(intercept) - mean(data[[outcome_var]], na.rm = TRUE)))
+  
+  # ----------------------------------------
+  # Calibration-in-the-large (centred)
+  # ----------------------------------------
+  cat("\n--- Calibration-in-the-large ---\n")
+  cat(sprintf("Centred intercept: %.4f (95%% CI: %.4f to %.4f)\n",
+              intercept,
+              intercept - 1.96 * intercept_se,
+              intercept + 1.96 * intercept_se))
+  cat(sprintf("Equivalent probability: %.4f\n", plogis(intercept)))
+  cat(sprintf("Observed outcome rate:  %.4f\n", mean(data[[outcome_var]], na.rm = TRUE)))
+  cat("(Intercept of 0 = perfect calibration-in-the-large)\n")
+  
+  # ----------------------------------------
+  # Predict probabilities from centred model
+  # ----------------------------------------
+  predicted_probs <- predict(logistic_model, type = "response")
+  
+  # Diagnostics
+  cat(sprintf("\nPredicted prob range: %.4f to %.4f\n",
+              min(predicted_probs), max(predicted_probs)))
+  cat(sprintf("Mean predicted probability: %.4f\n", mean(predicted_probs)))
+  cat(sprintf("Observed outcome rate:      %.4f\n", mean(data[[outcome_var]], na.rm = TRUE)))
+  cat(sprintf("Correlation with outcome:   %.4f\n",
+              cor(predicted_probs, data[[outcome_var]], use = "complete.obs")))
+  
+  # ----------------------------------------
+  # Calibration slope model (centred score, both parameters free)
+  # ----------------------------------------
+  cal_slope_model <- glm(
+    as.formula(paste0(outcome_var, " ~ fixed_score")),
+    data   = data,
+    family = binomial(link = "logit")
+  )
+  
+  cal_intercept    <- coef(cal_slope_model)[1]
+  cal_intercept_se <- summary(cal_slope_model)$coefficients[1, 2]
+  cal_slope        <- coef(cal_slope_model)[2]
+  cal_slope_se     <- summary(cal_slope_model)$coefficients[2, 2]
+  
+  cat("\n--- Calibration slope model ---\n")
+  cat(sprintf("Intercept: %.4f (95%% CI: %.4f to %.4f)\n",
+              cal_intercept,
+              cal_intercept - 1.96 * cal_intercept_se,
+              cal_intercept + 1.96 * cal_intercept_se))
+  cat(sprintf("Slope:     %.4f (95%% CI: %.4f to %.4f)\n",
+              cal_slope,
+              cal_slope - 1.96 * cal_slope_se,
+              cal_slope + 1.96 * cal_slope_se))
+  cat("(Slope of 1.0 = perfect calibration across range of predictions)\n")
+  cat("(Slope < 1.0 = predictions too extreme; slope > 1.0 = too conservative)\n")
+  
+  # ----------------------------------------
+  # ROC curve
+  # ----------------------------------------
+  roc_obj <- roc(response    = data[[outcome_var]],
+                 predictor   = predicted_probs,
+                 direction   = "<",
+                 legacy.axes = TRUE,
+                 plot        = TRUE,
+                 col         = "#377eb8",
+                 lwd         = 1.5,
+                 print.auc   = TRUE,
+                 print.auc.x = 0.7,
+                 print.auc.y = 1.0,
+                 ci          = TRUE,
+                 main        = paste("ROC Curve", title_suffix))
+  
+  auc_ci <- ci.auc(roc_obj, method = "bootstrap", boot.n = 1000)
+  cat(sprintf("\nAUC: %.3f [%.3f, %.3f]\n", roc_obj$auc, auc_ci[1], auc_ci[3]))
+  
+  # ----------------------------------------
+  # Brier score
+  # ----------------------------------------
+  true_outcomes <- data[[outcome_var]]
+  brier_score   <- mean((predicted_probs - true_outcomes)^2, na.rm = TRUE)
+  cat(sprintf("Brier Score: %.4f\n", brier_score))
+  
+# ----------------------------------------
+# Calibration plot (decile binning + shaded 95% CI ribbon)
+# ----------------------------------------
+
+data$predicted_prob <- predicted_probs
+data$decile         <- ntile(data$predicted_prob, 10)
+
+# Create calibration summary table
+calibration_data <- data %>%
+  dplyr::group_by(decile) %>%
+  dplyr::summarise(
+    mean_predicted      = mean(predicted_prob, na.rm = TRUE),
+    observed_proportion = mean(.data[[outcome_var]], na.rm = TRUE),
+    n                   = dplyr::n(),
+    events              = sum(.data[[outcome_var]], na.rm = TRUE),
+    .groups             = "drop"
+  )
+
+# Add exact binomial 95% confidence intervals
+ci_data <- binom.confint(
+  x      = calibration_data$events,
+  n      = calibration_data$n,
+  method = "exact"
+)
+
+calibration_data <- calibration_data %>%
+  dplyr::mutate(
+    lower_ci = ci_data$lower,
+    upper_ci = ci_data$upper
+  ) %>%
+  dplyr::arrange(mean_predicted)
+
+# Generate calibration plot
+cal_plot <- ggplot(
+  calibration_data,
+  aes(x = mean_predicted,
+      y = observed_proportion)
+) +
+
+  # Shaded confidence interval ribbon
+  geom_ribbon(
+    aes(ymin = lower_ci,
+        ymax = upper_ci),
+    fill  = "blue",
+    alpha = 0.2
+  ) +
+
+  # Calibration line
+  geom_line(
+    color = "blue",
+    linewidth = 1
+  ) +
+
+  # Calibration points
+  geom_point(
+    color = "blue",
+    size  = 2
+  ) +
+
+  # Perfect calibration reference line
+  geom_abline(
+    slope     = 1,
+    intercept = 0,
+    linetype  = "dashed",
+    color     = "black"
+  ) +
+
+  labs(
+    title = paste("Calibration Plot", title_suffix),
+
+    subtitle = paste0(
+      "Brier Score: ", round(brier_score, 4),
+      " | Slope: ", round(cal_slope, 3),
+      " | Intercept (centred): ", round(intercept, 3),
+      " | Intercept (uncentred): ", round(intercept_uncentred, 3)
+    ),
+
+    x = "Mean predicted probability (decile)",
+    y = "Observed proportion"
+  ) +
+
+  scale_x_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.2)
+  ) +
+
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.2)
+  ) +
+
+  theme_pubr() +
+
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face  = "bold"
+    ),
+
+    plot.subtitle = element_text(
+      hjust = 0.5,
+      size  = 8
+    )
+  )
+
+#return(cal_plot)
+
+# Used for yearly analysis
+return(list(
+  plot          = cal_plot,
+  auc           = as.numeric(roc_obj$auc),
+  ci_lower      = auc_ci[1],
+  ci_upper      = auc_ci[3],
+  brier         = brier_score,
+  slope         = cal_slope,
+  intercept     = intercept,
+  intercept_unc = intercept_uncentred,
+  n             = nrow(data)
+))
+
+}
+```
+
+```{r}
+# 1 -- Discriminative Performance and Calibration Metrics for Binary Outcomes --
+# Example Usage 
+
+    # Set negate_score = TRUE for positive outcomes (mRS 2 & 3)
+    #     negate_score = FALSE for negative outcomes (90d mortality)
+
+# -- WHOLE COHORT MRS2 -- 
+# Subset your data to preclude patients with baseline mRS >2 
+
+Hermes_2_FINAL <- Hermes_FINAL_vessel[Hermes_FINAL_vessel$estimated_prestroke_mrs <= 2,]
+
+plot_mrs2 <- evaluate_binary_outcome(data = Hermes_2_FINAL,
+                        outcome_var = "mRS_2",
+                        age_var = "age_at_stroke",
+                        nihss_var = "nihss_24_hrs_prior_reperfusion_therapy",
+                        title_suffix = "for mRS ≤ 2",
+                        negate_score = TRUE)
+
+# -- WHOLE COHORT MRS 3 --
+# Subset your data to preclude patients with baseline mRS >3
+Hermes_3_FINAL <- Hermes_FINAL_vessel[Hermes_FINAL_vessel$estimated_prestroke_mrs <= 3,]
+
+plot_mrs3 <- evaluate_binary_outcome(data = Hermes_3_FINAL,
+                        outcome_var = "mRS_3",
+                        age_var = "age_at_stroke",
+                        nihss_var = "nihss_24_hrs_prior_reperfusion_therapy",
+                        title_suffix = "for mRS ≤ 3", 
+                        negate_score = TRUE)
+
+# -- WHOLE COHORT MORTALITY -- 
+# No sub-setting is required as all patients even with pre-existing disability can be included for this analysis. 
+
+plot_mortality <- evaluate_binary_outcome(data = Hermes_FINAL_vessel,
+                        outcome_var = "timedif_mortality_lastknown_90d",
+                        age_var = "age_at_stroke",
+                        nihss_var = "nihss_24_hrs_prior_reperfusion_therapy",
+                        title_suffix = "Mortality at 90d",
+                        negate_score = FALSE)
+
+```
+
+```{r}
+# 2 -- Ordinal Analysis --
+
+# CREATE DATASET FOR ORDINAL ANALYSIS
+# By convention (mRS 5 and 6 are treated as the same class)
+Hermes_ordinal <- Hermes_FINAL_vessel
+Hermes_ordinal$x3_month_mrs[Hermes_FINAL_vessel$x3_month_mrs == 6] <-5
+```
+
+```{r}
+# 2 -- Ordinal Analysis --
+# HELPER FUNCTION 2 - Ordinal Concordance Index 
+
+concordance_index <- function(outcome, predicted_score) {
+  n <- length(outcome)
+  concordant <- 0
+  discordant <- 0
+  
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      if (outcome[i] != outcome[j]) {
+        if ((outcome[i] > outcome[j] && predicted_score[i] > predicted_score[j]) ||
+            (outcome[i] < outcome[j] && predicted_score[i] < predicted_score[j])) {
+          concordant <- concordant + 1
+        } else if ((outcome[i] > outcome[j] && predicted_score[i] < predicted_score[j]) ||
+                   (outcome[i] < outcome[j] && predicted_score[i] > predicted_score[j])) {
+          discordant <- discordant + 1
+        }
+      }
+    }
+  }
+  
+  concordance_index <- concordant / (concordant + discordant)
+  return(concordance_index)
+}
+
+#Bootstrap function
+bootstrap_c_index <- function(data, n_bootstraps = 1000) {
+  boot_results <- numeric(n_bootstraps)
+  
+  for (i in 1:n_bootstraps) {
+    boot_sample <- data[sample(1:nrow(data), replace = TRUE), ]
+    boot_results[i] <- concordance_index(boot_sample$outcome, boot_sample$predicted)
+  }
+  
+  return(boot_results)
+}
+
+#Evaluate ordinal outcome for single dataset
+evaluate_ordinal_outcome <- function(data, outcome_var, predictor_var,
+                                     title_suffix = "", n_bootstraps = 100) {
+  outcome <- data[[outcome_var]]
+  predicted <- data[[predictor_var]]
+  
+  # Original concordance index
+  c_index_val <- concordance_index(outcome, predicted)
+  
+  # Bootstrap CI
+  boot_data <- data.frame(outcome = outcome, predicted = predicted)
+  boot_results <- bootstrap_c_index(boot_data, n_bootstraps)
+  ci_lower <- quantile(boot_results, 0.025)
+  ci_upper <- quantile(boot_results, 0.975)
+  
+  # Output
+  cat("Ordinal Concordance Index", if (!is.null(title_suffix)) paste0(" ", title_suffix), 
+      ":", round(c_index_val, 3), "\n")
+  cat("95% CI:", round(ci_lower, 3), "–", round(ci_upper, 3), "\n")
+  
+  return(list(c_index = c_index_val, ci_lower = ci_lower, ci_upper = ci_upper))
+}
+
+```
+
+```{r}
+# 2 -- Ordinal Analysis --
+# Example, ordinal discriminative perform for 3 month mRS
+
+evaluate_ordinal_outcome(
+  data = Hermes_ordinal,
+  outcome_var = "x3_month_mrs",
+  predictor_var = "HERMES_Score",
+  title_suffix = "Discriminative performance for ordinal mRS", 
+  n_bootstraps = 100
+)
+
+```
+
+
+```{r}
+# 3 -- SUBGROUP ANALYSIS OF BINARY OUTCOMES --
+# Builds upon "evaluate_binary_outcome" function defined previously for binary outcome analysis, with wrapper function 
+
+evaluate_subgroups <- function(data, subgroup_var, subgroup_labels, subgroup_conditions,
+                               outcome_var, age_var, nihss_var, outcome_label = NULL) {
+  
+  stopifnot(length(subgroup_labels) == length(subgroup_conditions))
+  
+  for (i in seq_along(subgroup_labels)) {
+    label <- subgroup_labels[i]
+    condition_expr <- subgroup_conditions[[i]]
+    
+    # Subset data
+    subgroup_data <- data %>% filter(!!rlang::parse_expr(condition_expr))
+    n <- nrow(subgroup_data)
+    
+    cat("\n----------------------------------------\n")
+    cat("Subgroup:", label, "\n")
+    cat("N =", n, "\n")
+    
+    if (n < 30) {
+      warning(paste("Subgroup", label, "has < 30 patients. Results may be unstable."))
+    }
+    
+    evaluate_binary_outcome(subgroup_data, outcome_var, age_var, nihss_var,
+                            title_suffix = paste0("(", label, ") ", outcome_label))
+  }
+}
+
+
+```
+
+```{r}
+# 3 -- SUBGROUP ANALYSIS OF BINARY OUTCOMES --
+# EXAMPLE USAGE (stratifying by patients aged >70 and <= 70) for binary outcome mRS <= 2
+
+evaluate_subgroups(
+  data = Hermes_2_FINAL,
+  subgroup_var = "age_at_stroke",
+  subgroup_labels = c("Age < 70", "Age ≥ 70"),
+  subgroup_conditions = c("age_at_stroke < 70", "age_at_stroke >= 70"),
+  outcome_var = "mRS_2",
+  age_var = "age_at_stroke",
+  nihss_var = "nihss_24_hrs_prior_reperfusion_therapy",
+  outcome_label = "for mRS ≤ 2")
+
+
+```
+
+```{r}
+# 4 -- SUBGROUP ANALYSIS OF ORDINAL OUTCOMES --
+# Builds upon "evaluate_ordinal_outcome" function defined previously for binary outcome analysis, with wrapper function 
+
+
+# Wrapper for evaluating subgroups
+evaluate_ordinal_subgroups <- function(data, subgroup_labels, subgroup_conditions,
+                                       outcome_var, predictor_var,
+                                       outcome_label = NULL, n_bootstraps = 100) {
+  
+  stopifnot(length(subgroup_labels) == length(subgroup_conditions))
+  
+  for (i in seq_along(subgroup_labels)) {
+    label <- subgroup_labels[i]
+    condition_expr <- subgroup_conditions[[i]]
+    
+    subgroup_data <- data %>% dplyr::filter(!!rlang::parse_expr(condition_expr))
+    n <- nrow(subgroup_data)
+    
+    cat("\n----------------------------------------\n")
+    cat("Subgroup:", label, "\n")
+    cat("N =", n, "\n")
+    
+    if (n < 30) {
+      warning(paste("Subgroup", label, "has < 30 patients. Results may be unstable."))
+    }
+    
+    evaluate_ordinal_outcome(
+      data = subgroup_data,
+      outcome_var = outcome_var,
+      predictor_var = predictor_var,
+      title_suffix = paste0("(", label, ") ", outcome_label),
+      n_bootstraps = n_bootstraps
+    )
+  }
+}
+
+```
+
+```{r}
+# # 4 -- SUBGROUP ANALYSIS OF ORDINAL OUTCOMES --
+# EXAMPLE USAGE (stratifying by thrombolysed and non-thrombolysed patients, evaluating for ordinal mRS)
+
+evaluate_ordinal_subgroups(
+  data = Hermes_ordinal,
+  subgroup_labels = c("No thrombolysis", "Thrombolysis"),
+  subgroup_conditions = c('yn_thrombolysed == "No"', 'yn_thrombolysed == "Yes"'),
+  outcome_var = "x3_month_mrs",
+  predictor_var = "HERMES_Score",
+  outcome_label = "for ordinal 3-month mRS",
+  n_bootstraps = 100
+)
+
+
+```
+
+```{r}
+# 5 -- Temporal model performance --
+# Evalutes HERMES-24 performance annually for all years (of sufficient size >30) in the dataset 
+
+compute_annual_auc <- function(data, outcome_var, age_var, nihss_var,
+                                negate_score = TRUE, title_suffix = "") {
+  
+  years <- sort(unique(data$admission_year))
+  
+  annual_results <- lapply(years, function(yr) {
+    year_data <- data[data$admission_year == yr, ]
+    
+    if (nrow(year_data) < 30) {
+      warning(paste("Year", yr, "has < 30 patients — skipping"))
+      return(data.frame(year     = yr,
+                        auc      = NA,
+                        ci_lower = NA,
+                        ci_upper = NA,
+                        brier    = NA,
+                        slope    = NA,
+                        intercept = NA,
+                        n        = nrow(year_data)))
+    }
+    
+    # Incorporates previous binary outcome analysis function 
+    result <- evaluate_binary_outcome(
+      data         = year_data,
+      outcome_var  = outcome_var,
+      age_var      = age_var,
+      nihss_var    = nihss_var,
+      title_suffix = paste(title_suffix, yr),
+      negate_score = negate_score
+    )
+    
+    data.frame(
+      year      = yr,
+      auc       = result$auc,
+      ci_lower  = result$ci_lower,
+      ci_upper  = result$ci_upper,
+      brier     = result$brier,
+      slope     = result$slope,
+      intercept = result$intercept,
+      n         = result$n
+    )
+  })
+  
+  annual_df <- do.call(rbind, annual_results)
+  annual_df <- annual_df[!is.na(annual_df$auc), ]
+  
+  # Plot annual AUC trend
+  p <- ggplot(annual_df, aes(x = year, y = auc)) +
+    geom_line(color = "blue") +
+    geom_point(color = "blue", size = 2) +
+    geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper),
+                  width = 0.2, color = "blue", alpha = 0.6) +
+    geom_text(aes(y     = ci_upper,
+              label = sprintf("%.2f\n(%.2f–%.2f)", auc, ci_lower, ci_upper)),
+          vjust      = -0.3,      # small fixed gap above ci_upper
+          hjust      = 0.5,
+          size       = 2.5,
+          color      = "black",
+          lineheight = 0.85) +
+    geom_vline(xintercept = 2019.5, linetype = "dashed", color = "black") +
+    scale_y_continuous(limits = c(0.5, 1.05), breaks = seq(0.5, 1.0, by = 0.1)) +
+    scale_x_continuous(breaks = years) +
+    labs(
+      title   = paste("Annual AUC trend", title_suffix),
+      x       = "Admission year",
+      y       = "AUC (95% CI)",
+      caption = paste0("n per year: ",
+                       paste(paste0(annual_df$year, " (n=", annual_df$n, ")"),
+                             collapse = ", "))
+    ) +
+    theme_pubr() +
+    theme(
+      plot.title   = element_text(hjust = 0.5, face = "bold"),
+      plot.caption = element_text(size = 7, hjust = 0)
+    )
+  
+  return(list(plot = p, data = annual_df))
+}
+```
+
+```{r}
+# 5 -- Temporal model performance --
+# EXAMPLE USAGE - Model performance for binary outcome mRS <=2 for all included years in dataset 
+
+result_mrs2 <- compute_annual_auc(
+  data         = Hermes_2_FINAL,
+  outcome_var  = "mRS_2",
+  age_var      = "age_at_stroke",
+  nihss_var    = "nihss_24_hrs_prior_reperfusion_therapy",
+  negate_score = TRUE,
+  title_suffix = "— mRS ≤2"
+)
+```
+
+```{r}
+# 6 -- Sensitivity to time-point cut-off analysis -- 
+
+sensitivity_cutpoint_analysis <- function(data, outcome_var, age_var, nihss_var,
+                                           negate_score = TRUE,
+                                           cutpoints = 2018:2021,
+                                           n_bootstraps = 2000,
+                                           title_suffix = "") {
+  
+  sensitivity_results <- lapply(cutpoints, function(cut) {
+    
+    cat(sprintf("\n--- Testing cutpoint: %d ---\n", cut))
+    
+    pre  <- data[data$admission_year <= cut, ]
+    post <- data[data$admission_year >  cut, ]
+    
+    cat(sprintf("Pre n = %d, Post n = %d\n", nrow(pre), nrow(post)))
+    
+    # Get AUC for each epoch using your existing function
+    result_pre  <- evaluate_binary_outcome(
+      data         = pre,
+      outcome_var  = outcome_var,
+      age_var      = age_var,
+      nihss_var    = nihss_var,
+      title_suffix = paste("pre", cut),
+      negate_score = negate_score
+    )
+    
+    result_post <- evaluate_binary_outcome(
+      data         = post,
+      outcome_var  = outcome_var,
+      age_var      = age_var,
+      nihss_var    = nihss_var,
+      title_suffix = paste("post", cut),
+      negate_score = negate_score
+    )
+    
+       # Bootstrap the DELTA AUC between the two independent cohorts
+    set.seed(42)
+    
+    bootstrap_delta <- function(pre, post, outcome_var, age_var, nihss_var, 
+                                negate_score, n_bootstraps) {
+      replicate(n_bootstraps, {
+        
+        s_pre  <- pre[sample(nrow(pre),   replace = TRUE), ]
+        s_post <- post[sample(nrow(post), replace = TRUE), ]
+        
+        # Compute score in each bootstrap sample
+        if (negate_score) {
+          s_pre$fixed_score  <- -(0.1 * s_pre[[age_var]]  + 1 * s_pre[[nihss_var]])
+          s_post$fixed_score <- -(0.1 * s_post[[age_var]] + 1 * s_post[[nihss_var]])
+        } else {
+          s_pre$fixed_score  <-  (0.1 * s_pre[[age_var]]  + 1 * s_pre[[nihss_var]])
+          s_post$fixed_score <-  (0.1 * s_post[[age_var]] + 1 * s_post[[nihss_var]])
+        }
+        
+        # Fit offset model in each bootstrap sample
+        model_pre  <- glm(as.formula(paste0(outcome_var, " ~ offset(fixed_score)")),
+                          data = s_pre,  family = binomial(link = "logit"))
+        model_post <- glm(as.formula(paste0(outcome_var, " ~ offset(fixed_score)")),
+                          data = s_post, family = binomial(link = "logit"))
+        
+        # Predicted probabilities
+        p_pre  <- predict(model_pre,  type = "response")
+        p_post <- predict(model_post, type = "response")
+        
+        # AUC for each bootstrap sample
+        auc_pre  <- as.numeric(pROC::auc(pROC::roc(s_pre[[outcome_var]],
+                                                     p_pre,
+                                                     direction = "<",
+                                                     quiet     = TRUE)))
+        auc_post <- as.numeric(pROC::auc(pROC::roc(s_post[[outcome_var]],
+                                                     p_post,
+                                                     direction = "<",
+                                                     quiet     = TRUE)))
+        auc_post - auc_pre
+      })
+    }
+    
+    delta_boot <- bootstrap_delta(
+      pre          = pre,
+      post         = post,
+      outcome_var  = outcome_var,
+      age_var      = age_var,
+      nihss_var    = nihss_var,
+      negate_score = negate_score,
+      n_bootstraps = n_bootstraps
+    )
+    
+    # Summarise bootstrap results
+    data.frame(
+      cutpoint      = cut,
+      n_pre         = nrow(pre),
+      n_post        = nrow(post),
+      auc_pre       = result_pre$auc,
+      auc_pre_lo    = result_pre$ci_lower,
+      auc_pre_hi    = result_pre$ci_upper,
+      auc_post      = result_post$auc,
+      auc_post_lo   = result_post$ci_lower,
+      auc_post_hi   = result_post$ci_upper,
+      delta_auc     = mean(delta_boot),
+      delta_ci_lo   = quantile(delta_boot, 0.025),
+      delta_ci_hi   = quantile(delta_boot, 0.975),
+      p_value       = 2 * min(mean(delta_boot >= 0), mean(delta_boot < 0))
+    )
+  })
+  
+  sensitivity_df <- do.call(rbind, sensitivity_results)
+  rownames(sensitivity_df) <- NULL
+  
+  # ----------------------------------------
+  # Plot 1 — AUC by epoch for each cutpoint
+  # ----------------------------------------
+  
+  # Reshape for plotting
+  plot_df <- rbind(
+    data.frame(cutpoint  = sensitivity_df$cutpoint,
+               epoch     = "Pre-cutpoint",
+               auc       = sensitivity_df$auc_pre,
+               ci_lower  = sensitivity_df$auc_pre_lo,
+               ci_upper  = sensitivity_df$auc_pre_hi),
+    data.frame(cutpoint  = sensitivity_df$cutpoint,
+               epoch     = "Post-cutpoint",
+               auc       = sensitivity_df$auc_post,
+               ci_lower  = sensitivity_df$auc_post_lo,
+               ci_upper  = sensitivity_df$auc_post_hi)
+  )
+  
+  p1 <- ggplot(plot_df, aes(x = factor(cutpoint), y = auc,
+                             color = epoch, group = epoch)) +
+    geom_line() +
+    geom_point(size = 2) +
+    geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper),
+                  width = 0.15, alpha = 0.6) +
+    scale_color_manual(values = c("Pre-cutpoint"  = "blue",
+                                  "Post-cutpoint" = "red")) +
+    scale_y_continuous(limits = c(0.5, 1.0), breaks = seq(0.5, 1.0, by = 0.1)) +
+    labs(
+      title  = paste("AUC by epoch across alternative cutpoints", title_suffix),
+      x      = "Cutpoint year (pre ≤ year vs post > year)",
+      y      = "AUC (95% CI)",
+      color  = "Epoch"
+    ) +
+    theme_pubr() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          legend.position = "bottom")
+  
+  # ----------------------------------------
+  # Plot 2 — Delta AUC across cutpoints
+  # ----------------------------------------
+  
+    p2 <- ggplot(sensitivity_df, aes(x = factor(cutpoint), y = delta_auc)) +
+    geom_point(color = "black", size = 2) +
+    geom_errorbar(aes(ymin = delta_ci_lo, ymax = delta_ci_hi),
+                  width = 0.15, color = "black", alpha = 0.6) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    # ΔAUC value and 95% CI label sitting above the upper error bar
+    geom_text(aes(y     = delta_ci_hi,
+                  label = sprintf("ΔAUC: %.3f\n(%.3f to %.3f)\np=%.3f",
+                                  delta_auc,
+                                  delta_ci_lo,
+                                  delta_ci_hi,
+                                  p_value)),
+              vjust      = -0.3,
+              hjust      = 0.5,
+              size       = 2.5,
+              color      = "black",
+              lineheight = 0.85) +
+    scale_y_continuous(limits = c(min(sensitivity_df$delta_ci_lo) - 0.05,
+                                  max(sensitivity_df$delta_ci_hi) + 0.15),
+                       breaks = seq(-0.3, 0.3, by = 0.05)) +
+    labs(
+      title    = paste("ΔAUC (post minus pre) across alternative cutpoints", title_suffix),
+      subtitle = "Dashed line indicates no difference. Bootstrapped 95% CI shown.",
+      x        = "Cutpoint year",
+      y        = "ΔAUC (95% CI)"
+    ) +
+    theme_pubr() +
+    theme(plot.title    = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, size = 9))
+  
+  # ----------------------------------------
+  # Combined figure
+  # ----------------------------------------
+  
+  combined <- ggarrange(p1, p2, ncol = 1, nrow = 2, labels = c("A", "B"))
+  
+  return(list(
+    plot      = combined,
+    plot_auc  = p1,
+    plot_delta = p2,
+    data      = sensitivity_df
+  ))
+}
+```
+
+```{r}
+# 6 -- Sensitivity to time-point cut-off analysis -- 
+# EXAMPLE USAGE - Sensitivity cut-off analysis for 90-day mortality searching for separation in time epoch perfomance with 2018 - 2021 applied as a cut-off period.
+
+sens_mortality <- sensitivity_cutpoint_analysis(
+  data         = Hermes_FINAL_vessel,
+  outcome_var  = "timedif_mortality_lastknown_90d",
+  age_var      = "age_at_stroke",
+  nihss_var    = "nihss_24_hrs_prior_reperfusion_therapy",
+  negate_score = FALSE,
+  cutpoints    = 2018:2021,
+  n_bootstraps = 1000,
+  title_suffix = "— Mortality"
+)
+```
+
